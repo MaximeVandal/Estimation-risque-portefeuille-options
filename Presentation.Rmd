@@ -1,0 +1,660 @@
+---
+title: "TP2 - MATH-60633"
+authors: "Jérémy Lagacé / Faycal Berrada / Louis Gengembre / Maxime Levasseur-Vandal"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+<br>
+
+## 📌 Projet
+Ce document présente le code R et les résultats du **Travail Pratique 2** pour le **projet 2** (Gestion des risques) du cours **MATH-60633**, enseigné par **David Ardia**.
+
+##### ✍️ Réalisé par :
+- **Faycal Berrada**
+- **Jérémy Lagacé**
+- **Louis Gengembre**
+- **Maxime Levasseur-Vandal**
+
+<br>
+
+**Contexte** : 
+<br>
+Vous travaillez en tant qu'analyste quantitatif pour une grande banque d’investissement. Votre mission est de remettre en question les modèles utilisés par les traders et gestionnaires de risques. À l'aide de R et en respectant une approche de recherche reproductible, vous devez construire un cadre d'analyse du risque d'un portefeuille d'options.
+
+**Objectif** : 
+<br>
+Mettre en œuvre un cadre de gestion des risques pour un **portefeuille d'options d'achat européennes**, en tenant compte du **prix du sous-jacent (S&P 500)** et de la **volatilité implicite (VIX)**.
+
+<br>
+Ce document détaille le code R utilisé, la méthodologie adoptée, ainsi que les résultats obtenus.
+
+<hr>
+
+## 📌 Les étapes du travail :
+
+<br>
+
+### 🔹 Données et fonctions importées
+
+On initialise le projet en important les librairies nécessaires, les fonctions personnalisées utilisées dans le travail, et en fixant un seed pour assurer la reproductibilité. 
+
+Les données de *Market.rda* contiennent l'historique du S&P 500, l'indice VIX, les taux d'intérêt, ainsi que les caractéristiques des options d'achat et de vente disponibles sur le marché.
+
+```{r setup, include = FALSE}
+# Chargement des librairies nécessaires
+library(here)
+library(PerformanceAnalytics)
+library(mvtnorm)
+library(copula)
+library(MASS)
+library(fGarch)
+library(plotly)
+library(qrmtools)
+library(xts)
+
+# Chargement des fonctions personnalisées
+source(here("Function", "Int_Lin.R"))
+source(here("Function", "Prix_PF.R"))
+source(here("Function", "Func_Vol_Surface.R"))
+source(here("Function", "Plot_Risk.R"))
+
+# Seed pour la reproductibilité
+seedSimul <- 123
+
+# Chargement des données de marché
+load(here("Data", "Market.rda"))
+
+# Préparation des données
+Rf <- data.frame(Maturity = as.numeric(names(Market[["rf"]])), Rate = Market[["rf"]])
+SP500 <- Market$sp500
+VIX <- Market$vix
+Calls <- as.data.frame(Market$calls)
+Puts <- as.data.frame(Market$puts)
+```
+
+```{r, eval = FALSE}
+# Chargement des librairies nécessaires
+library(here)
+library(PerformanceAnalytics)
+library(mvtnorm)
+library(copula)
+library(MASS)
+library(fGarch)
+library(plotly)
+library(qrmtools)
+library(xts)
+
+
+# Chargement des fonctions personnalisées
+source(here("Function", "Int_Lin.R"))
+source(here("Function", "Prix_PF.R"))
+source(here("Function", "Func_Vol_Surface.R"))
+source(here("Function", "Plot_Risk.R"))
+
+# Seed pour la reproductibilité
+seedSimul <- 123
+
+# Chargement des données de marché
+load(here("Data", "Market.rda"))
+
+# Préparation des données
+Rf <- data.frame(Maturity = as.numeric(names(Market[["rf"]])), Rate = Market[["rf"]])
+SP500 <- Market$sp500
+VIX <- Market$vix
+Calls <- as.data.frame(Market$calls)
+Puts <- as.data.frame(Market$puts)
+```
+
+
+<br>
+<hr>
+Le fichier *Int_Lin.R* contient la fonction *Int_lin*, qui calcule le taux d'intérêt interpolé linéairement.
+
+```{r, eval = FALSE}
+Int_lin <- function(Time, maturities, rf_rates) {
+  idx <- max(which(maturities <= Time))
+  T1 <- maturities[idx]
+  T2 <- maturities[idx + 1]
+  r1 <- rf_rates[idx]
+  r2 <- rf_rates[idx + 1]
+  
+  # Formule d'interpolation linéaire
+  r_T <- r1 + ((Time - T1) * (r2 - r1)) / (T2 - T1)
+  return(r_T)
+}
+```
+
+Le fichier *Prix_PF.R* contient la fonction *Prix_PF*, qui calcule le prix d'un portefeuille composé de 4 options d'achat européennes.
+
+```{r, eval = FALSE}
+Prix_PF <- function(S, vol, K, tau ,R){ 
+
+  P1 <- Black_Scholes(0, S, R[1], vol, K[1] , tau[1], "call")
+  P2 <- Black_Scholes(0, S, R[2], vol, K[2] , tau[2], "call")
+  P3 <- Black_Scholes(0, S, R[3], vol, K[3] , tau[3], "call")
+  P4 <- Black_Scholes(0, S, R[4], vol, K[4] , tau[4], "call")
+  P <- P1 + P2 + P3 + P4 # Prix du portefeuille d'options
+  return(P)
+}
+```
+
+
+Le fichier *Func_Vol_Surface.R* contient les fonctions *sigma_model*, *loss_function*, *sigma_model_w* et *Prix_PF_alpha*. Ces fonctions permettent de calibrer une surface de volatilité implicite aux données observées, d'ajuster cette surface en fonction du VIX, et de réévaluer dynamiquement le prix du portefeuille d'options en fonction de cette surface ajustée.
+
+```{r, eval = FALSE}
+
+sigma_model <- function(m, tau, alpha) {
+  sigma <- alpha[1] + alpha[2] * (m - 1)^2 + alpha[3] * (m - 1)^3 + alpha[4] * sqrt(tau)
+  return(sigma)
+}
+
+loss_function <- function(alpha, m, tau, sigma_obs) {
+  sigma_pred <- sigma_model(m, tau, alpha)
+  loss <- sum(abs(sigma_obs - sigma_pred))
+  return(loss)
+}
+
+sigma_model_w <- function(m, tau, alpha, vix) {
+  sig_mod <- sigma_model(m, tau, alpha)
+  sig_mod_w <- sig_mod - (alpha[1] + alpha[4]) + vix
+  return(sig_mod_w)
+}
+
+Prix_PF_alpha <- function(S, vix, K, tau, alpha, R) {
+  prix_options <- mapply(function(k, t, r) {
+    vol_ajustee <- sigma_model_w(k/S, t, alpha, vix)
+    Black_Scholes(0, S, r, vol_ajustee, k, t, "call")
+  }, K, tau, R)
+  
+  P <- sum(prix_options)
+  return(P)
+}
+
+```
+
+Le fichier *Plot_Risk.R* contient la fonction *f_PlotPLWithRiskMeasures*, qui trace la distribution du P&L avec la VaR et l'ES.
+
+```{r, eval = FALSE}
+f_PlotPLWithRiskMeasures <- function(PL_distribution, option_book_price, title = "Distribution P&L du portefeuille (5 jours)") {
+  
+  ### Étape 1 : Calcul des mesures de risque
+  
+  # VaR 95% absolue (quantile 5%)
+  VaR_95_abs <- quantile(PL_distribution, 0.05)
+  
+  # ES 95% absolue (moyenne des pertes au-delà de la VaR)
+  ES_95_abs <- mean(PL_distribution[PL_distribution <= VaR_95_abs])
+  
+  # VaR et ES relatives au prix initial
+  VaR_95_rel <- VaR_95_abs / option_book_price
+  ES_95_rel <- ES_95_abs / option_book_price
+  
+  ### Étape 2 : Tracé de l'histogramme
+  
+  hist(PL_distribution,
+       xlim = c(-500, 500),
+       breaks = 50,
+       col = "lightgray",
+       border = "black",
+       main = title,
+       xlab = "P&L en $")
+  
+  # Ajout des lignes verticales pour VaR et ES
+  abline(v = VaR_95_abs, col = "red", lwd = 2)    # VaR en rouge
+  abline(v = ES_95_abs, col = "blue", lwd = 2)    # ES en bleu
+  
+  # Ajout de la légende
+  legend("topright",
+         legend = c(
+           paste0("VaR 95% = ", round(VaR_95_abs, 2), " $"),
+           paste0("ES 95%  = ", round(ES_95_abs, 2), " $")
+         ),
+         col = c("red", "blue"),
+         lwd = 2,
+         box.lty = 0)
+}
+
+```
+
+<br>
+<hr>
+
+### 🔹 Fixation du prix d’un portefeuille d’options
+
+Notre portefeuille est composé de 4 options d'achat européennes :
+
+- 1 option avec strike \(K = 1600\) et échéance de 20 jours
+- 1 option avec strike \(K = 1650\) et échéance de 20 jours
+- 1 option avec strike \(K = 1750\) et échéance de 40 jours
+- 1 option avec strike \(K = 1800\) et échéance de 40 jours
+
+<br>
+
+À noter que les taux d'intérêt sont interpolés linéairement pour trouver les taux correspondants.  
+Nous utilisons 360 jours/an pour la structure des taux, et 250 jours/an pour la maturité des options.
+
+
+```{r, echo = TRUE}
+# Interpolation des taux
+r_20 <- Int_lin(20/360, Rf$Maturity, Rf$Rate)
+r_40 <- Int_lin(40/360, Rf$Maturity, Rf$Rate)
+
+# Paramètres
+T_20 <- 20/250
+T_40 <- 40/250
+K <- c(1600, 1650, 1750, 1800)
+tau <- c(T_20, T_20, T_40, T_40)
+R <- c(r_20, r_20, r_40, r_40)
+
+# Prix spot
+SP500_T <- last(SP500)
+VIX_T <- last(VIX)
+
+# Prix initial du portefeuille
+Prix_PF1 <- Prix_PF(SP500_T, VIX_T, K, tau, R)
+```
+
+<br>
+
+#### 🎯 Prix du portefeuille d'options
+
+Le prix de se portefeuille est égale à :
+
+> `r round(Prix_PF1,2)`$
+
+<br>
+<hr>
+
+### 🔹 Un facteur de risque et un modèle gaussien univarié
+
+**Hypothèses** :
+<br>
+> Les rendements journaliers du S&P 500 sont supposés être **iid** et **normalement distribués**.
+<br>
+> La volatilé implicite (VIX) est supposée **constante** pendant la période.
+
+**Important** : 
+<br>
+> Comme nous simulons à **5 jours d'avance**, les échéances restantes des options diminuent de 5 jours.
+<br>
+> Ainsi, les échéances passent de 20 à 15 jours et de 40 à 35 jours. Les taux sont également réinterpolés.
+
+
+```{r, echo = TRUE}
+# Calcul des rendements logarithmiques du SP500
+rets_SP500_log <- CalculateReturns(SP500, method = "log")[-1,]
+mu_SP500 <- mean(rets_SP500_log)
+sigma_SP500 <- sd(rets_SP500_log)
+
+# Simulation de 10 000 scénarios
+set.seed(seedSimul)
+n_scenarios <- 10000
+n_jours <- 5
+scenarios <- matrix(rnorm(n_scenarios * n_jours, mu_SP500, sigma_SP500), nrow = n_scenarios)
+SP500_sim <- as.numeric(SP500_T) * exp(rowSums(scenarios))
+
+# Réévaluation du portefeuille
+r_15 <- Int_lin(15/360, Rf$Maturity, Rf$Rate)
+r_35 <- Int_lin(35/360, Rf$Maturity, Rf$Rate)
+T_15 <- 15/250
+T_35 <- 35/250
+tau <- c(T_15, T_15, T_35, T_35)
+R <- c(r_15, r_15, r_35, r_35)
+
+PF_SIM_1 <- Prix_PF(SP500_sim, vol = as.numeric(VIX_T), K = K, tau = tau, R = R)
+PnL <- PF_SIM_1 - as.numeric(Prix_PF1)
+
+# Calcul VaR et ES
+VaR_95 <- quantile(PnL, 0.05)
+ES_95 <- mean(PnL[PnL <= VaR_95])
+```
+<br>
+```{r, echo=FALSE, fig.width=14, fig.height=5}
+# Distribution P&L du portefeuille d’options
+hist_PnL <- f_PlotPLWithRiskMeasures(PnL, Prix_PF1, title = "P&L - Modèle Univarié")
+```
+
+>La Value-at-Risk à 95 % (VaR95) est égale à `r round(VaR_95,2)` $
+
+>L'Expected Shortfall à 95 % (ES95) est de `r round(ES_95,2)` $
+
+<br>
+<hr>
+### 🔹 Deux facteurs de risque et modèle gaussien bivarié
+
+**Hypothèses** :
+<br>
+> Les rendements du **S&P 500** et du **VIX** sont supposés **iid et normalement distribués**.
+<br>
+> La dépendance est modélisée par la matrice de covariance empirique.
+
+```{r, echo = TRUE}
+# Calcul des rendements logarithmiques quotidiens du VIX
+rets_VIX_log <- CalculateReturns(VIX, method = "log")[-1,]
+
+# Estimation conjointe
+rets <- cbind(rets_SP500_log, rets_VIX_log)
+mu_biv <- colMeans(rets)
+Sigma_biv <- cov(rets) * (nrow(rets) - 1) / nrow(rets)
+
+# Simulation
+set.seed(seedSimul)
+rets_sim_biv <- matrix(0, nrow = n_scenarios, ncol = 2)
+
+for (i in 1:5) {
+  rets_sim_biv <- rets_sim_biv + rmvnorm(n = n_scenarios, mean = mu_biv, sigma = Sigma_biv)
+}
+
+P_SP500_sim <- as.numeric(SP500_T) * exp(rets_sim_biv[,1])
+P_VIX_sim <- as.numeric(VIX_T) * exp(rets_sim_biv[,2])
+
+PF_SIM_2 <- Prix_PF(P_SP500_sim, P_VIX_sim, K, tau, R)
+PnL_Biv <- PF_SIM_2 - as.numeric(Prix_PF1)
+
+# Calcul VaR et ES
+VaR_95_Biv <- quantile(PnL_Biv, 0.05)
+ES_95_Biv <- mean(PnL_Biv[PnL_Biv <= VaR_95_Biv])
+
+```
+<br>
+```{r, echo=FALSE, fig.width=14, fig.height=5}
+# Distribution P&L du portefeuille d’options
+hist_PnL_Biv <- f_PlotPLWithRiskMeasures(PnL_Biv, Prix_PF1, title = "P&L - Modèle Bivarié")
+```
+
+
+En prenant en compte les deux facteurs de risque, on obtient :
+
+> VaR95 de `r round(VaR_95_Biv,2)`$
+
+> ES95 de `r round(ES_95_Biv,2)`$
+
+On constate que ces mesures diffèrent de celles obtenues avec le modèle univarié, soulignant l'importance de considérer l'impact de la volatilité implicite sur le risque du portefeuille.
+
+
+<br>
+<hr>
+### 🔹 Deux facteurs de risque et modèle copule-marginal (Student-t et copule gaussienne)
+
+**Hypothèses** :
+<br>
+> **S&P 500** → Student-t ν=10,
+<br>
+> **VIX** → Student-t ν=5,
+<br>
+> Dépendance modélisée par une copule gaussienne.
+
+
+```{r, echo = TRUE}
+# Ajustement des marginales
+fit1 <- suppressWarnings(fitdistr(rets_SP500_log, densfun = dstd, start = list(mean = 0, sd = 1, nu = 10)))
+
+fit2 <- suppressWarnings(fitdistr(rets_VIX_log, densfun = dstd, start = list(mean = 0, sd = 1, nu = 5)))
+
+theta1 <- fit1$estimate
+theta2 <- fit2$estimate
+
+# Construction des pseudo-observations
+U1 <- pstd(rets_SP500_log, mean = theta1[1], sd = theta1[2], nu = theta1[3]) 
+U2 <- pstd(rets_VIX_log, mean = theta2[1], sd = theta2[2], nu = theta2[3]) 
+U <- cbind(U1, U2)
+
+# Ajustement de la copule normale
+C <- normalCopula(dim = 2)
+fit <- fitCopula(C, data = matrix(U, ncol=2), method = "ml")
+
+# Simulation avec boucle for sur 5 jours
+rets1_sim <- numeric(n_scenarios)
+rets2_sim <- numeric(n_scenarios)
+set.seed(seedSimul)
+
+for (day in 1:5) {
+  U_sim <- rCopula(n_scenarios, fit@copula)
+  
+  rets1_day <- qstd(U_sim[,1], mean = theta1[1], sd = theta1[2], nu = theta1[3])
+  rets2_day <- qstd(U_sim[,2], mean = theta2[1], sd = theta2[2], nu = theta2[3])
+  
+  rets1_sim <- rets1_sim + rets1_day
+  rets2_sim <- rets2_sim + rets2_day
+}
+
+# Prix simulés
+P_SP500_sim_2 <- as.numeric(SP500_T) * exp(rets1_sim)
+P_VIX_sim_2 <- as.numeric(VIX_T) * exp(rets2_sim)
+
+# Simulation du portefeuille et distribution des pertes et profits
+PF_SIM_3 <- Prix_PF(P_SP500_sim_2, P_VIX_sim_2, K, tau, R)
+PnL_Cop <- PF_SIM_3 - as.numeric(Prix_PF1)
+
+# Calcul VaR et ES
+VaR_95_Cop <- quantile(PnL_Cop, 0.05)
+ES_95_Cop <- mean(PnL_Cop[PnL_Cop <= VaR_95_Cop])
+```
+
+<br>
+
+```{r, echo=FALSE, fig.width=14, fig.height=5}
+# Affichage des fonctions
+par(mfrow = c(1, 2))
+
+hist(rets1_sim, breaks = 100, main = "S&P 500 (Student-t)", 
+     xlab = "Rendement sur 5 jours")
+hist(rets2_sim, breaks = 100, main = "VIX (Student-t)", 
+     xlab = "Rendement sur 5 jours")
+
+mtext("Rendements simulés", outer = TRUE, cex = 1.5, line = -1.1)
+
+par(mfrow = c(1, 1))
+
+hist_PnL_Cop <- f_PlotPLWithRiskMeasures(PnL_Cop, Prix_PF1, title = "P&L - Copule-Marginal (Boucle For)")
+```
+
+Le modèle copule-marginal permet une modélisation plus réaliste des distributions marginales grâce aux queues épaisses des distributions de Student-t.
+On obtient maintenant :
+
+> VaR95 de `r round(VaR_95_Cop,2)`$
+
+> ES95 de `r round(ES_95_Cop,2)`$
+
+<br>
+<hr>
+### 🔹 Surface de volatilité
+
+Nous allons maintenant ajuster une surface de volatilité aux volatilités implicites observées sur le marché, et l'utiliser pour évaluer notre portefeuille d'options.
+
+La surface paramétrique est donnée par l'équation :
+
+\[
+\sigma(m, \tau) = \alpha_1 + \alpha_2 (m - 1)^2 + \alpha_3 (m - 1)^3 + \alpha_4 \sqrt{\tau}
+\]
+
+où :
+\( m = \frac{K}{S} \) est le **moneyness**,
+\( \tau \) est la **maturité** (en années),
+\( \alpha_1, \alpha_2, \alpha_3, \alpha_4 \) sont les **paramètres** calibrés.
+
+
+Nous commençons par calibrer cette surface à partir des données de marché.
+
+```{r, echo=TRUE}
+# Fusion des données de Calls et Puts
+Call_Put <- rbind(Calls, Puts)
+
+# Calcul du moneyness, extraction des maturités et volatilités observées
+m_CP <- Call_Put$K / as.numeric(SP500_T)
+tau_CP <- Call_Put$tau
+sigma_obs_CP <- Call_Put$IV
+
+# Estimation des paramètres alpha
+alpha0 <- c(0.2, 0.1, 0, 0.05)  # Valeurs initiales
+res_Call_Put <- optim(par = alpha0, fn = loss_function, m = m_CP, tau = tau_CP, sigma_obs = sigma_obs_CP)
+alpha_opt_call_put <- res_Call_Put$par
+```
+
+Nous obtenons les paramètres optimisés de la surface de volatilité suivant : 
+
+> `r round(alpha_opt_call_put,3)`.
+
+Ensuite, nous visualisons la surface ajustée.
+
+```{r, echo=TRUE}
+# Grille pour moneyness et maturité
+moneyness <- seq(min(m_CP), max(m_CP), by = 0.01)
+maturity <- seq(min(tau_CP), max(tau_CP), by = 0.01)
+
+# Calcul de la surface de volatilité
+volatility_surface <- outer(moneyness, maturity, Vectorize(function(m, t) sigma_model(m, t, alpha_opt_call_put)))
+```
+
+<br>
+
+```{r, echo=FALSE}
+# Tracé de la surface 3D
+fig <- plot_ly(x = moneyness, y = maturity, z = volatility_surface) %>%
+  add_surface() %>%
+  layout(
+    title = "Surface de Volatilité Implicite Paramétrique",
+    scene = list(
+      xaxis = list(title = "Moneyness (K/S)"),
+      yaxis = list(title = "Maturité (années)"),
+      zaxis = list(title = "Volatilité Implicite")
+    )
+  )
+fig
+```
+
+La forme smirk montre que la volatilité implicite augmente fortement pour les valeurs extrêmes de moneyness, en particulier du côté des options put. Cela traduit une anticipation par le marché de mouvements extrêmes à la baisse, les investisseurs exigeant une prime plus élevée pour se protéger contre des chocs importants.
+
+<br>
+Ainsi, nous réévaluons le prix du portefeuille avec le modèle paramétrique.
+
+```{r, echo=TRUE}
+# Prix du portefeuille initial avec la surface calibrée
+tau <- c(T_20, T_20, T_40, T_40)
+R <- c(r_20, r_20, r_40, r_40)
+
+P_VOL_T <- Prix_PF_alpha(SP500_T, VIX_T, K, tau, alpha_opt_call_put, R)
+```
+
+On obtient une valeur de :
+
+> `r round(P_VOL_T,2)`$
+
+<br>
+
+Après, nous réalisons une simulation afin d'estimer le prix du portefeuille à l'horizon T+5.
+
+```{r, echo=TRUE}
+# Simulation du portefeuille à T+5 jours pour chaque scénario simulé
+tau <- c(T_15, T_15, T_35, T_35)
+R <- c(r_15, r_15, r_35, r_35)
+
+PF_VOL_T5 <- sapply(1:n_scenarios, function(i) {
+  Prix_PF_alpha(P_SP500_sim_2[i], P_VIX_sim_2[i], K, tau, alpha_opt_call_put, R)
+})
+
+# Calcul du P&L
+PnL_VOL <- PF_VOL_T5 - as.numeric(P_VOL_T)
+```
+<br>
+```{r, echo=FALSE, fig.width=14, fig.height=5}
+hist(PF_VOL_T5, breaks = 200,
+     main = "Distribution du prix du portefeuille (surface ajustée)",
+     xlab = "Prix ($)", col = "lightgray",xlim = c(0,1000))
+
+abline(v = mean(PF_VOL_T5), col = "red", lwd = 2)
+abline(v = median(PF_VOL_T5), col = "blue", lwd = 2)
+abline(v = P_VOL_T, col = "darkgreen", lwd = 2)
+
+legend("topright",
+       legend = c(
+         paste("Mean :", round(mean(PF_VOL_T5), 2), "$"),
+         paste("Median :", round(median(PF_VOL_T5), 2), "$"),
+         paste("Initial :", round(P_VOL_T, 2), "$")),
+       col = c("red", "blue", "darkgreen"),
+       lty = 1, cex = 0.8)
+```
+
+Enfin, nous calculons les mesures de risque (VaR et ES) associées.
+
+```{r, echo=TRUE}
+# Value-at-Risk (VaR) à 95%
+VaR_95_VOL <- quantile(PnL_VOL, 0.05)
+
+# Expected Shortfall (ES) à 95%
+ES_95_VOL <- mean(PnL_VOL[PnL_VOL <= VaR_95_VOL])
+```
+<br>
+```{r, echo=FALSE, fig.width=14, fig.height=5}
+# Affichage des résultats
+hist_PnL_VOL <- f_PlotPLWithRiskMeasures(PnL_VOL, Prix_PF1, title = "P&L - Surface de Volatilité Ajustée")
+```
+
+<br>
+<hr>
+### 🔹 Conclusion
+
+```{r, echo=FALSE}
+library(knitr)
+
+resultats_risque <- data.frame(
+  Modèle = c(
+    "Modèle univarié (SP500)",
+    "Modèle bivarié (SP500 + VIX)",
+    "Modèle copule-marginal",
+    "Surface de volatilité"
+  ),
+  VaR_95 = c(
+    round(VaR_95, 2),
+    round(VaR_95_Biv, 2),
+    round(VaR_95_Cop, 2),
+    round(VaR_95_VOL, 2)
+  ),
+  ES_95 = c(
+    round(ES_95, 2),
+    round(ES_95_Biv, 2),
+    round(ES_95_Cop, 2),
+    round(ES_95_VOL, 2)
+  )
+)
+
+kable(resultats_risque, caption = "Résumé des mesures de risque (VaR et ES)")
+```
+
+## Conclusion
+
+Notre analyse a permis d'évaluer le risque d'un portefeuille d'options européennes à l'aide de plusieurs approches de modélisation :
+
+- **Modèle univarié (S&P 500 seul)** :
+  - Ce modèle génère les mesures de risque (VaR95 et ES95) les plus défavorables.
+  - En ne considérant qu'un seul facteur de risque (le prix du sous-jacent) et en supposant une distribution normale, il ignore la dynamique de la volatilité, ce qui peut conduire à une surestimation des pertes potentielles.
+
+- **Modèle bivarié (S&P 500 + VIX)** :
+  - En intégrant la volatilité implicite (VIX) comme facteur de risque supplémentaire, les pertes estimées diminuent.
+  - Cette réduction s'explique par la nature des options d'achat (calls), qui sont **delta positif** (leur valeur augmente si le sous-jacent monte) et **vega positif** (leur valeur augmente si la volatilité implicite monte).
+  - Or, la **corrélation négative entre le S&P 500 et le VIX** fait que lorsque le prix du sous-jacent baisse (impact négatif via le delta), la volatilité implicite augmente (impact positif via le vega). Ces deux effets tendent à **se compenser partiellement**, limitant ainsi les pertes du portefeuille dans les scénarios défavorables.
+
+- **Modèle copule-marginal (Student-t + copule gaussienne)** :
+  - En capturant mieux les dépendances non linéaires et les queues épaisses grâce aux distributions de Student-t, ce modèle propose des estimations de risque encore plus prudentes.
+  - Il montre que les hypothèses traditionnelles de normalité peuvent sous-estimer la probabilité d'événements extrêmes.
+
+- **Surface de volatilité ajustée** :
+  - En utilisant une surface paramétrique pour ajuster dynamiquement la volatilité implicite selon le moneyness et l'échéance, on obtient une valorisation du portefeuille plus réaliste.
+  - Cette approche révèle que la volatilité implicite ne doit pas être supposée constante pour une évaluation fiable du risque.
+
+<br>
+
+**En résumé** :
+
+- Prendre en compte **plusieurs facteurs de risque** (prix et volatilité),
+- Utiliser **des distributions réalistes** avec **queues épaisses**,
+- Et modéliser une **volatilité dynamique** via une surface,
+
+sont essentiels pour mieux estimer le risque de pertes extrêmes sur un portefeuille d'options.
+
+Notre analyse montre également que, pour un portefeuille composé de **calls** (vega positif et delta positif), la **corrélation négative entre le sous-jacent et le VIX** agit comme une **protection naturelle** en période de stress de marché.
+
+<br>
+<br>
+<hr>
